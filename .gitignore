@@ -1,0 +1,6 @@
+/*
+!src/
+!src/**
+!.gitignore
+!Cargo.*
+!README.md
