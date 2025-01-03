@@ -91,7 +91,7 @@ impl Server {
     fn wait_event(&self) -> Result<Cqe> {
         let mut ring = self.ring.borrow_mut();
 
-        unsafe { ring.submitter().enter(0, 1, 0, None as Option<&()>) }
+        unsafe { ring.submitter().enter(0, 1, 1, None as Option<&()>) }
             .context("Wait for event")?;
 
         let cqe = ring.completion().next().context("Empty cq after wait")?;
