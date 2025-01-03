@@ -7,7 +7,7 @@ use std::pin::Pin;
 use std::rc::Rc;
 use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use io_uring::cqueue::Entry as Cqe;
 use io_uring::opcode::AcceptMulti;
 use io_uring::types::Fd;
@@ -38,32 +38,36 @@ pub struct Server {
 }
 
 impl Server {
-    pub fn bind(bind_address: impl ToSocketAddrs) -> Self {
-        let listener = TcpListener::bind(bind_address).expect("bind");
+    pub fn bind(bind_address: impl ToSocketAddrs) -> Result<Self> {
+        let listener = TcpListener::bind(bind_address).context("Bind")?;
 
         let ring = IoUring::builder()
             .build(URING_BUFFER_SIZE)
-            .expect("build io_uring");
+            .context("Build io_uring")?;
 
         let buffer_pool = BufferPool::new(BUFFERS_COUNT, BUFFER_SIZE);
         let iovecs = buffer_pool.iovecs();
-        unsafe { ring.submitter().register_buffers(&iovecs) }.expect("register buffers");
+        unsafe { ring.submitter().register_buffers(&iovecs) }.context("Register buffers")?;
 
-        Self {
+        Ok(Self {
             listener,
             ring: Rc::new(RefCell::new(ring)),
             buffer_pool,
             clients: HashMap::new(),
             client_id_counter: 0,
-        }
+        })
     }
 
-    pub fn run(mut self) {
-        self.start_accepting();
+    pub fn run(mut self) -> Result<()> {
+        self.start_accepting()?;
 
         loop {
-            let Some(cqe) = self.wait_event() else {
-                continue;
+            let cqe = match self.wait_event() {
+                Ok(cqe) => cqe,
+                Err(err) => {
+                    eprintln!("Wait event: {err:#}");
+                    continue;
+                }
             };
 
             match cqe.user_data().into() {
@@ -73,21 +77,25 @@ impl Server {
         }
     }
 
-    fn start_accepting(&mut self) {
+    fn start_accepting(&mut self) -> Result<()> {
         let sqe = AcceptMulti::new(Fd(self.listener.as_raw_fd()))
             .build()
             .user_data(Route::Accept.into());
 
         let mut ring = self.ring.borrow_mut();
-        unsafe { ring.submission().push(&sqe) }.expect("push multi-accept");
-        ring.submit().expect("submit accept");
+        unsafe { ring.submission().push(&sqe) }.context("Push AcceptMulti")?;
+        ring.submit().context("Submit AcceptMulti")?;
+        Ok(())
     }
 
-    fn wait_event(&self) -> Option<Cqe> {
+    fn wait_event(&self) -> Result<Cqe> {
         let mut ring = self.ring.borrow_mut();
-        unsafe { ring.submitter().enter(0, 1, 0, None as Option<&()>) }.expect("wait for event");
-        let cqe = ring.completion().next()?;
-        Some(cqe)
+
+        unsafe { ring.submitter().enter(0, 1, 0, None as Option<&()>) }
+            .context("Wait for event")?;
+
+        let cqe = ring.completion().next().context("Empty cq after wait")?;
+        Ok(cqe)
     }
 
     fn handle_accept(&mut self, cqe: Cqe) {

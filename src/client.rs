@@ -5,7 +5,7 @@ use std::pin::Pin;
 use std::rc::Rc;
 use std::task::{Context, Poll};
 
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use io_uring::cqueue::Entry as Cqe;
 use io_uring::opcode::{ReadFixed, WriteFixed};
 use io_uring::types::Fd;
@@ -76,8 +76,8 @@ impl Client {
 
         {
             let mut ring = self.ring.borrow_mut();
-            unsafe { ring.submission().push(&sqe) }.expect("push read");
-            ring.submit().expect("submit read");
+            unsafe { ring.submission().push(&sqe) }.context("Push read")?;
+            ring.submit().context("Submit read")?;
         }
 
         let cqe = WaitEventFuture::new(Rc::clone(&self.cqe)).await;
@@ -101,8 +101,8 @@ impl Client {
 
         {
             let mut ring = self.ring.borrow_mut();
-            unsafe { ring.submission().push(&sqe) }.expect("push write");
-            ring.submit().expect("submit write");
+            unsafe { ring.submission().push(&sqe) }.context("Push write")?;
+            ring.submit().context("Submit write")?;
         }
 
         let cqe = WaitEventFuture::new(Rc::clone(&self.cqe)).await;
