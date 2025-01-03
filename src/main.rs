@@ -1,3 +1,6 @@
+#[macro_use]
+extern crate anyhow;
+
 mod buffer;
 mod client;
 mod common;

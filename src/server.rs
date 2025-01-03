@@ -1,9 +1,13 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::future::Future;
 use std::net::{TcpListener, ToSocketAddrs};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::pin::Pin;
 use std::rc::Rc;
+use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
+use anyhow::Result;
 use io_uring::cqueue::Entry as Cqe;
 use io_uring::opcode::AcceptMulti;
 use io_uring::types::Fd;
@@ -18,11 +22,18 @@ const URING_BUFFER_SIZE: u32 = 1024;
 const BUFFERS_COUNT: u16 = 8192;
 const BUFFER_SIZE: u32 = 32_768;
 
+static VTABLE_STUB: RawWakerVTable = RawWakerVTable::new(
+    |ptr| RawWaker::new(ptr, &VTABLE_STUB),
+    |_| {},
+    |_| {},
+    |_| {},
+);
+
 pub struct Server {
     listener: TcpListener,
     ring: Rc<RefCell<IoUring>>,
     buffer_pool: BufferPool,
-    clients: HashMap<Id, Client>,
+    clients: HashMap<Id, Task>,
     client_id_counter: u32,
 }
 
@@ -57,8 +68,7 @@ impl Server {
 
             match cqe.user_data().into() {
                 Route::Accept => self.handle_accept(cqe),
-                Route::ClientRead(id) => self.handle_client_read(cqe, id),
-                Route::ClientWrite(id) => self.handle_client_write(cqe, id),
+                Route::Client(id) => self.handle_client(cqe, id),
             }
         }
     }
@@ -94,40 +104,54 @@ impl Server {
             if let Some(buffer) = self.buffer_pool.acquire() {
                 let id = self.client_id_counter;
                 self.client_id_counter += 1;
-                let mut client = Client::new(id, fd, buffer, Rc::clone(&self.ring));
-                client.submit_read();
-                self.clients.insert(id, client);
+                let cqe = Rc::new(RefCell::new(None));
+
+                let mut client =
+                    Client::new(id, fd, buffer, Rc::clone(&self.ring), Rc::clone(&cqe));
+
+                let fut = Box::pin(async move { client.handle().await });
+                let mut task = Task { fut, cqe };
+
+                match task.poll() {
+                    Poll::Pending => {
+                        self.clients.insert(id, task);
+                    }
+                    Poll::Ready(Ok(())) => (),
+                    Poll::Ready(Err(err)) => eprintln!("Client #{id} failed: {err:#}"),
+                }
             } else {
                 eprintln!("No free buffers, disconnecting client");
             }
         }
     }
 
-    fn handle_client_read(&mut self, cqe: Cqe, id: Id) {
-        if cqe.result() < 0 {
-            eprintln!("Read error: {}", Errno(-cqe.result()));
-            self.clients.remove(&id);
-        } else if let Some(client) = &mut self.clients.get_mut(&id) {
-            if client.complete_read(cqe.result() as u32) {
-                self.clients.remove(&id);
+    fn handle_client(&mut self, cqe: Cqe, id: Id) {
+        if let Some(task) = self.clients.get_mut(&id) {
+            *task.cqe.borrow_mut() = Some(cqe);
+
+            match task.poll() {
+                Poll::Pending => return,
+                Poll::Ready(Ok(())) => (),
+                Poll::Ready(Err(err)) => eprintln!("Client #{id} failed: {err:#}"),
             }
+
+            self.clients.remove(&id);
         } else {
             eprintln!("Missing client #{id}");
         }
     }
+}
 
-    fn handle_client_write(&mut self, cqe: Cqe, id: Id) {
-        if cqe.result() < 0 {
-            eprintln!("Write error: {}", Errno(-cqe.result()));
-            self.clients.remove(&id);
-        } else if let Some(client) = &mut self.clients.get_mut(&id) {
-            if client.complete_write(cqe.result() as u32) {
-                self.clients.remove(&id);
-            } else {
-                client.submit_read();
-            }
-        } else {
-            eprintln!("Missing client #{id}");
-        }
+struct Task {
+    fut: Pin<Box<dyn Future<Output = Result<()>>>>,
+    cqe: Rc<RefCell<Option<Cqe>>>,
+}
+
+impl Task {
+    fn poll(&mut self) -> Poll<Result<()>> {
+        let raw_waker = RawWaker::new(&(), &VTABLE_STUB);
+        let waker = unsafe { Waker::from_raw(raw_waker) };
+        let mut cx = Context::from_waker(&waker);
+        Pin::new(&mut self.fut).poll(&mut cx)
     }
 }

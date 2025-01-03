@@ -4,8 +4,7 @@ pub type Id = u32;
 #[repr(u32)]
 pub enum Route {
     Accept,
-    ClientRead(Id),
-    ClientWrite(Id),
+    Client(Id),
 }
 
 impl From<Route> for u64 {
